@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_URL="https://raw.githubusercontent.com/7069wrk/CSILinux-Powerup/79942af21517cd96dbc59148b4adc18dd20d3ff9/csi_ir.txt"
+LOCAL_FALLBACK="./csi_ir.txt"
+BACKUP_ROOT="/var/backups/ir-configs"
+MANIFEST_URL="$DEFAULT_URL"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --url)
+      MANIFEST_URL="$2"
+      shift 2
+      ;;
+    --fallback)
+      LOCAL_FALLBACK="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root or with sudo." >&2
+  exit 1
+fi
+
+# Per-tool custom config paths (only backed up when 'backup' flag is present on the line)
+get_cfg_paths() {
+  case "$1" in
+    ufw|gufw) echo "/etc/ufw" ;;
+    lynis) echo "/etc/lynis" ;;
+    rkhunter) echo "/etc/rkhunter.conf /etc/rkhunter.conf.local" ;;
+    chkrootkit) echo "/etc/chkrootkit.conf" ;;
+    clamav|clamtk) echo "/etc/clamav" ;;
+    wireshark) echo "/etc/wireshark" ;;
+    *) echo "" ;;
+  esac
+}
+
+backup_tool_config() {
+  local pkg="$1"
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  local dest="${BACKUP_ROOT}/${pkg}/${stamp}"
+  local paths
+  paths="$(get_cfg_paths "$pkg")"
+
+  if [[ -z "$paths" ]]; then
+    echo "  [CFG-SKIP] No config paths mapped for $pkg"
+    return 0
+  fi
+
+  mkdir -p "$dest"
+  local backed_up=0
+  for p in $paths; do
+    if [[ -e "$p" ]]; then
+      cp -a "$p" "$dest/"
+      backed_up=1
+    fi
+  done
+
+  if [[ "$backed_up" -eq 1 ]]; then
+    echo "  [CFG-BACKUP] Saved $pkg config to $dest"
+  else
+    rmdir "$dest" 2>/dev/null || true
+    echo "  [CFG-SKIP] Mapped config paths not present on disk for $pkg"
+  fi
+}
+
+TMP_LIST="$(mktemp)"
+trap 'rm -f "$TMP_LIST"' EXIT
+
+if curl -fsSL --connect-timeout 10 --max-time 30 "$MANIFEST_URL" -o "$TMP_LIST" && grep -qvE '^\s*(#|$)' "$TMP_LIST"; then
+  echo "[SOURCE] Loaded manifest from $MANIFEST_URL"
+elif [[ -f "$LOCAL_FALLBACK" ]] && grep -qvE '^\s*(#|$)' "$LOCAL_FALLBACK"; then
+  echo "[WARN] Remote fetch failed; falling back to $LOCAL_FALLBACK"
+  cp "$LOCAL_FALLBACK" "$TMP_LIST"
+else
+  echo "[ERROR] Could not load valid manifest from remote URL or local fallback." >&2
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+
+installed_count=0
+upgraded_count=0
+skipped_count=0
+warned_count=0
+
+while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+  # Strip inline comments, trim whitespace, and skip empty/comment lines
+  clean="${raw_line%%#*}"
+  clean="$(echo "$clean" | xargs)"
+  [[ -z "$clean" ]] && continue
+
+  pkg="$(echo "$clean" | awk '{print $1}')"
+  flag="$(echo "$clean" | awk '{print $2}')"
+
+  candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+    echo "[WARN] $pkg: no APT candidate found"
+    warned_count=$((warned_count + 1))
+    continue
+  fi
+
+  if dpkg-query -W -f='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -qx "installed"; then
+    inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
+    if [[ "$inst_ver" == "$candidate" ]]; then
+      echo "[SKIP] $pkg ($inst_ver) is already up to date"
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    if [[ "$flag" == "backup" ]]; then
+      backup_tool_config "$pkg"
+    fi
+
+    echo "[UPGRADE] $pkg: $inst_ver -> $candidate"
+    apt-get install --only-upgrade -y "$pkg"
+    upgraded_count=$((upgraded_count + 1))
+  else
+    echo "[INSTALL] $pkg ($candidate)"
+    apt-get install -y "$pkg"
+    installed_count=$((installed_count + 1))
+  fi
+done < "$TMP_LIST"
+
+echo ""
+echo "Summary: installed=${installed_count}, upgraded=${upgraded_count}, skipped=${skipped_count}, warnings=${warned_count}"
