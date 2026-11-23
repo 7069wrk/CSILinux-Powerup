@@ -7,6 +7,7 @@ BACKUP_ROOT="/var/backups/ir-configs"
 LOG_ROOT="/var/log/irup"
 MANIFEST_URL="$DEFAULT_URL"
 DRY_RUN=0
+REMOVE_MODE=0
 SKIP_PKGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -25,6 +26,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_PKGS="${2:-}"
       [[ -n "$SKIP_PKGS" ]] || { echo "--skip requires a comma-separated package list" >&2; exit 1; }
       shift 2
+      ;;
+    --remove)
+      REMOVE_MODE=1
+      shift 1
       ;;
     --dry-run)
       DRY_RUN=1
@@ -95,6 +100,10 @@ is_user_skipped() {
   return 1
 }
 
+is_pkg_installed() {
+  dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null | grep -qx "installed"
+}
+
 get_cfg_paths() {
   case "${1:-}" in
     ufw|gufw) echo "/etc/ufw" ;;
@@ -156,8 +165,11 @@ TMP_LIST="$(mktemp)"
 PARSED_LIST="$(mktemp)"
 trap 'rm -f "$TMP_LIST" "$PARSED_LIST"' EXIT
 
-ui_line "IRup run started (${RUN_ID}) | Full log: ${FULL_LOG}"
-[[ "$DRY_RUN" -eq 1 ]] && ui_line "Mode: DRY-RUN (no changes will be made)"
+mode_label="INSTALL/UPGRADE"
+(( REMOVE_MODE == 1 )) && mode_label="REMOVE"
+
+ui_line "IRup run started (${RUN_ID}) | Mode: ${mode_label} | Full log: ${FULL_LOG}"
+[[ "$DRY_RUN" -eq 1 ]] && ui_line "Dry-run enabled: no system changes will be made"
 [[ -n "${SKIP_PKGS:-}" ]] && ui_line "User skip list: ${SKIP_PKGS}"
 
 if curl -fsSL --connect-timeout 10 --max-time 30 "$MANIFEST_URL" -o "$TMP_LIST" 2>>"$FULL_LOG" && grep -qvE '^\s*(#|$)' "$TMP_LIST"; then
@@ -187,20 +199,25 @@ if (( total_pkgs == 0 )); then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-ui_line "[00/${total_pkgs} |   0%] Refreshing APT package index..."
-if (( DRY_RUN == 1 )); then
-  apt-get update >> "$FULL_LOG" 2>&1 || true
-else
-  if ! apt-get update >> "$FULL_LOG" 2>&1; then
-    log_event "ERROR" "apt-get update failed"
-    echo "[FAIL] apt-get update failed — see $FULL_LOG" >&2
-    exit 1
+
+if (( REMOVE_MODE == 0 )); then
+  ui_line "[00/${total_pkgs} |   0%] Refreshing APT package index..."
+  if (( DRY_RUN == 1 )); then
+    apt-get update >> "$FULL_LOG" 2>&1 || true
+  else
+    if ! apt-get update >> "$FULL_LOG" 2>&1; then
+      log_event "ERROR" "apt-get update failed"
+      echo "[FAIL] apt-get update failed — see $FULL_LOG" >&2
+      exit 1
+    fi
   fi
 fi
 
 idx=0
 installed_count=0
 upgraded_count=0
+removed_count=0
+absent_count=0
 current_count=0
 skipped_count=0
 backed_up_count=0
@@ -221,6 +238,50 @@ while IFS=$'\t' read -r pkg flag; do
     continue
   fi
 
+  if (( REMOVE_MODE == 1 )); then
+    if ! is_pkg_installed "$pkg"; then
+      absent_count=$((absent_count + 1))
+      log_event "ABSENT" "$pkg (not installed)"
+      ui_line "${prefix} ${pkg} -> ABSENT"
+      continue
+    fi
+
+    inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
+    cfg_note=""
+    if [[ "$flag" == "backup" ]]; then
+      if (( DRY_RUN == 1 )); then
+        cfg_note=" + cfg-backup(dry-run)"
+        backed_up_count=$((backed_up_count + 1))
+        log_event "CFG-BACKUP" "$pkg (dry-run)"
+      else
+        if backup_tool_config "$pkg"; then
+          cfg_note=" + cfg-backed-up"
+          backed_up_count=$((backed_up_count + 1))
+        fi
+      fi
+    fi
+
+    if (( DRY_RUN == 1 )); then
+      removed_count=$((removed_count + 1))
+      log_event "REMOVE" "$pkg ($inst_ver) (dry-run)"
+      ui_line "${prefix} ${pkg} -> WOULD REMOVE (${inst_ver})${cfg_note:-}"
+      continue
+    fi
+
+    if run_apt_quiet "$pkg" remove -y "$pkg"; then
+      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
+      removed_count=$((removed_count + 1))
+      log_event "REMOVE" "$pkg ($inst_ver) (${dur})"
+      ui_line "${prefix} ${pkg} -> REMOVED (${inst_ver}, ${dur})${cfg_note:-}"
+    else
+      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
+      failed_count=$((failed_count + 1))
+      log_event "FAIL" "remove $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}.log"
+      ui_line "${prefix} ${pkg} -> FAIL remove (${dur}) [log: ${PKG_LOG_DIR}/${pkg}.log]"
+    fi
+    continue
+  fi
+
   candidate="$(apt-cache policy "$pkg" 2>>"$FULL_LOG" | awk '/Candidate:/ {print $2}')"
   if [[ -z "${candidate:-}" || "$candidate" == "(none)" ]]; then
     warned_count=$((warned_count + 1))
@@ -229,7 +290,7 @@ while IFS=$'\t' read -r pkg flag; do
     continue
   fi
 
-  if dpkg-query -W -f='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -qx "installed"; then
+  if is_pkg_installed "$pkg"; then
     inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
     if [[ "$inst_ver" == "$candidate" ]]; then
       current_count=$((current_count + 1))
@@ -296,7 +357,11 @@ total_elapsed="$(format_elapsed $(( $(date +%s) - START_EPOCH )))"
 
 echo ""
 ui_line "=== IRup Summary (${total_elapsed}) ==="
-ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Current: ${current_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
+if (( REMOVE_MODE == 1 )); then
+  ui_line "Removed: ${removed_count} | Absent: ${absent_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Failures: ${failed_count}"
+else
+  ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Current: ${current_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
+fi
 ui_line "Events log: ${EVENTS_LOG}"
 ui_line "Full log:   ${FULL_LOG} (symlink: ${LATEST_LINK})"
 
