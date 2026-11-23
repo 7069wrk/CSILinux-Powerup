@@ -200,9 +200,9 @@ while IFS=$'\t' read -r pkg flag; do
   if dpkg-query -W -f='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -qx "installed"; then
     inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
     if [[ "$inst_ver" == "$candidate" ]]; then
-      skipped_count=$((skipped_count + 1))
-      log_event "SKIP" "$pkg ($inst_ver)"
-      ui_line "${prefix} ${pkg} -> SKIP (${inst_ver})"
+      current_count=$((current_count + 1))
+      log_event "CURRENT" "$pkg ($inst_ver)"
+      ui_line "${prefix} ${pkg} -> CURRENT (${inst_ver})"
       continue
     fi
 
@@ -264,7 +264,7 @@ total_elapsed="$(format_elapsed $(( $(date +%s) - START_EPOCH )))"
 
 echo ""
 ui_line "=== IRup Summary (${total_elapsed}) ==="
-ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
+ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Current: ${current_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
 ui_line "Events log: ${EVENTS_LOG}"
 ui_line "Full log:   ${FULL_LOG} (symlink: ${LATEST_LINK})"
 
