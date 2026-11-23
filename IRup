@@ -50,14 +50,10 @@ fi
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${LOG_ROOT}/runs/${RUN_ID}"
 PKG_LOG_DIR="${RUN_DIR}/packages"
-FULL_LOG="${RUN_DIR}/full.log"
-EVENTS_LOG="${RUN_DIR}/events.log"
-LATEST_LINK="${LOG_ROOT}/latest.log"
-LATEST_DIR_LINK="${LOG_ROOT}/latest-run"
+FULL_LOG="${RUN_DIR}/irup-${RUN_ID}.log"
+EVENTS_LOG="${RUN_DIR}/events-${RUN_ID}.log"
 
 mkdir -p "$PKG_LOG_DIR" "$BACKUP_ROOT"
-ln -sfn "$FULL_LOG" "$LATEST_LINK"
-ln -sfn "$RUN_DIR" "$LATEST_DIR_LINK"
 touch "$FULL_LOG" "$EVENTS_LOG"
 
 START_EPOCH="$(date +%s)"
@@ -150,7 +146,7 @@ backup_tool_config() {
 run_apt_quiet() {
   local pkg="$1"
   shift
-  local pkg_log="${PKG_LOG_DIR}/${pkg}.log"
+  local pkg_log="${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
   {
     echo "=== COMMAND: DEBIAN_FRONTEND=noninteractive apt-get $* ==="
     echo "=== TIMESTAMP: $(date '+%Y-%m-%d %H:%M:%S') ==="
@@ -276,8 +272,8 @@ while IFS=$'\t' read -r pkg flag; do
     else
       dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
       failed_count=$((failed_count + 1))
-      log_event "FAIL" "remove $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}.log"
-      ui_line "${prefix} ${pkg} -> FAIL remove (${dur}) [log: ${PKG_LOG_DIR}/${pkg}.log]"
+      log_event "FAIL" "remove $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
+      ui_line "${prefix} ${pkg} -> FAIL remove (${dur}) [log: ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log]"
     fi
     continue
   fi
@@ -328,8 +324,8 @@ while IFS=$'\t' read -r pkg flag; do
     else
       dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
       failed_count=$((failed_count + 1))
-      log_event "FAIL" "upgrade $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}.log"
-      ui_line "${prefix} ${pkg} -> FAIL upgrade (${dur}) [log: ${PKG_LOG_DIR}/${pkg}.log]"
+      log_event "FAIL" "upgrade $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
+      ui_line "${prefix} ${pkg} -> FAIL upgrade (${dur}) [log: ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log]"
     fi
   else
     if (( DRY_RUN == 1 )); then
@@ -347,8 +343,8 @@ while IFS=$'\t' read -r pkg flag; do
     else
       dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
       failed_count=$((failed_count + 1))
-      log_event "FAIL" "install $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}.log"
-      ui_line "${prefix} ${pkg} -> FAIL install (${dur}) [log: ${PKG_LOG_DIR}/${pkg}.log]"
+      log_event "FAIL" "install $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
+      ui_line "${prefix} ${pkg} -> FAIL install (${dur}) [log: ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log]"
     fi
   fi
 done < "$PARSED_LIST"
@@ -363,7 +359,7 @@ else
   ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Current: ${current_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
 fi
 ui_line "Events log: ${EVENTS_LOG}"
-ui_line "Full log:   ${FULL_LOG} (symlink: ${LATEST_LINK})"
+ui_line "Full log:   ${FULL_LOG}"
 
 if (( failed_count > 0 )); then
   exit 1
