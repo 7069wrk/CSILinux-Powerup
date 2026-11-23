@@ -4,7 +4,9 @@ set -euo pipefail
 DEFAULT_URL="https://raw.githubusercontent.com/7069wrk/CSILinux-Powerup/79942af21517cd96dbc59148b4adc18dd20d3ff9/csi_ir.txt"
 LOCAL_FALLBACK="./csi_ir.txt"
 BACKUP_ROOT="/var/backups/ir-configs"
+LOG_ROOT="/var/log/irup"
 MANIFEST_URL="$DEFAULT_URL"
+DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,6 +17,10 @@ while [[ $# -gt 0 ]]; do
     --fallback)
       LOCAL_FALLBACK="$2"
       shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift 1
       ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -28,7 +34,46 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Per-tool custom config paths (only backed up when 'backup' flag is present on the line)
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="${LOG_ROOT}/runs/${RUN_ID}"
+PKG_LOG_DIR="${RUN_DIR}/packages"
+FULL_LOG="${RUN_DIR}/full.log"
+EVENTS_LOG="${RUN_DIR}/events.log"
+LATEST_LINK="${LOG_ROOT}/latest.log"
+LATEST_DIR_LINK="${LOG_ROOT}/latest-run"
+
+mkdir -p "$PKG_LOG_DIR" "$BACKUP_ROOT"
+ln -sfn "$FULL_LOG" "$LATEST_LINK"
+ln -sfn "$RUN_DIR" "$LATEST_DIR_LINK"
+touch "$FULL_LOG" "$EVENTS_LOG"
+
+START_EPOCH="$(date +%s)"
+
+log_event() {
+  local level="$1"
+  local msg="$2"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "[$ts] [$level] $msg" >> "$EVENTS_LOG"
+  echo "[$ts] [$level] $msg" >> "$FULL_LOG"
+}
+
+ui_line() {
+  echo "$1"
+  echo "$1" >> "$EVENTS_LOG"
+}
+
+format_elapsed() {
+  local sec="$1"
+  local mins=$((sec / 60))
+  local rem=$((sec % 60))
+  if (( mins > 0 )); then
+    printf "%dm%02ds" "$mins" "$rem"
+  else
+    printf "%ds" "$rem"
+  fi
+}
+
 get_cfg_paths() {
   case "$1" in
     ufw|gufw) echo "/etc/ufw" ;;
@@ -43,92 +88,186 @@ get_cfg_paths() {
 
 backup_tool_config() {
   local pkg="$1"
-  local stamp
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  local dest="${BACKUP_ROOT}/${pkg}/${stamp}"
+  local dest="${BACKUP_ROOT}/${pkg}/${RUN_ID}"
   local paths
   paths="$(get_cfg_paths "$pkg")"
 
   if [[ -z "$paths" ]]; then
-    echo "  [CFG-SKIP] No config paths mapped for $pkg"
-    return 0
+    log_event "CFG-SKIP" "$pkg: no config paths mapped"
+    return 1
   fi
 
   mkdir -p "$dest"
   local backed_up=0
   for p in $paths; do
     if [[ -e "$p" ]]; then
-      cp -a "$p" "$dest/"
+      cp -a "$p" "$dest/" >> "$FULL_LOG" 2>&1
       backed_up=1
     fi
   done
 
   if [[ "$backed_up" -eq 1 ]]; then
-    echo "  [CFG-BACKUP] Saved $pkg config to $dest"
+    log_event "CFG-BACKUP" "$pkg -> $dest"
+    return 0
   else
     rmdir "$dest" 2>/dev/null || true
-    echo "  [CFG-SKIP] Mapped config paths not present on disk for $pkg"
+    log_event "CFG-SKIP" "$pkg: mapped config paths not present on disk"
+    return 1
   fi
 }
 
-TMP_LIST="$(mktemp)"
-trap 'rm -f "$TMP_LIST"' EXIT
+run_apt_quiet() {
+  local pkg="$1"
+  shift
+  local pkg_log="${PKG_LOG_DIR}/${pkg}.log"
+  {
+    echo "=== COMMAND: DEBIAN_FRONTEND=noninteractive apt-get $* ==="
+    echo "=== TIMESTAMP: $(date '+%Y-%m-%d %H:%M:%S') ==="
+    DEBIAN_FRONTEND=noninteractive apt-get "$@"
+  } > "$pkg_log" 2>&1
+  local rc=$?
+  cat "$pkg_log" >> "$FULL_LOG"
+  return $rc
+}
 
-if curl -fsSL --connect-timeout 10 --max-time 30 "$MANIFEST_URL" -o "$TMP_LIST" && grep -qvE '^\s*(#|$)' "$TMP_LIST"; then
-  echo "[SOURCE] Loaded manifest from $MANIFEST_URL"
+TMP_LIST="$(mktemp)"
+PARSED_LIST="$(mktemp)"
+trap 'rm -f "$TMP_LIST" "$PARSED_LIST"' EXIT
+
+ui_line "IRup run started (${RUN_ID}) | Full log: ${FULL_LOG}"
+[[ "$DRY_RUN" -eq 1 ]] && ui_line "Mode: DRY-RUN (no changes will be made)"
+
+if curl -fsSL --connect-timeout 10 --max-time 30 "$MANIFEST_URL" -o "$TMP_LIST" 2>>"$FULL_LOG" && grep -qvE '^\s*(#|$)' "$TMP_LIST"; then
+  log_event "SOURCE" "Loaded manifest from $MANIFEST_URL"
 elif [[ -f "$LOCAL_FALLBACK" ]] && grep -qvE '^\s*(#|$)' "$LOCAL_FALLBACK"; then
-  echo "[WARN] Remote fetch failed; falling back to $LOCAL_FALLBACK"
+  log_event "WARN" "Remote fetch failed; falling back to $LOCAL_FALLBACK"
   cp "$LOCAL_FALLBACK" "$TMP_LIST"
 else
-  echo "[ERROR] Could not load valid manifest from remote URL or local fallback." >&2
+  log_event "ERROR" "Could not load valid manifest from remote URL or local fallback."
+  echo "[ERROR] Failed to load manifest. See $FULL_LOG" >&2
+  exit 1
+fi
+
+while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+  clean="${raw_line%%#*}"
+  clean="$(echo "$clean" | xargs)"
+  [[ -z "$clean" ]] && continue
+  pkg="$(echo "$clean" | awk '{print $1}')"
+  flag="$(echo "$clean" | awk '{print $2}')"
+  printf "%s\t%s\n" "$pkg" "$flag" >> "$PARSED_LIST"
+done < "$TMP_LIST"
+
+total_pkgs="$(wc -l < "$PARSED_LIST" | xargs)"
+if (( total_pkgs == 0 )); then
+  echo "[ERROR] Manifest contained 0 valid packages." >&2
   exit 1
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
+ui_line "[00/${total_pkgs} |   0%] Refreshing APT package index..."
+if (( DRY_RUN == 1 )); then
+  apt-get update >> "$FULL_LOG" 2>&1 || true
+else
+  if ! apt-get update >> "$FULL_LOG" 2>&1; then
+    log_event "ERROR" "apt-get update failed"
+    echo "[FAIL] apt-get update failed — see $FULL_LOG" >&2
+    exit 1
+  fi
+fi
 
+idx=0
 installed_count=0
 upgraded_count=0
+backed_up_count=0
 skipped_count=0
 warned_count=0
+failed_count=0
 
-while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-  # Strip inline comments, trim whitespace, and skip empty/comment lines
-  clean="${raw_line%%#*}"
-  clean="$(echo "$clean" | xargs)"
-  [[ -z "$clean" ]] && continue
+while IFS=$'\t' read -r pkg flag; do
+  idx=$((idx + 1))
+  pct=$((idx * 100 / total_pkgs))
+  prefix="$(printf "[%02d/%02d | %3d%%]" "$idx" "$total_pkgs" "$pct")"
+  pkg_start="$(date +%s)"
 
-  pkg="$(echo "$clean" | awk '{print $1}')"
-  flag="$(echo "$clean" | awk '{print $2}')"
-
-  candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  candidate="$(apt-cache policy "$pkg" 2>>"$FULL_LOG" | awk '/Candidate:/ {print $2}')"
   if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
-    echo "[WARN] $pkg: no APT candidate found"
     warned_count=$((warned_count + 1))
+    log_event "WARN" "$pkg: no APT candidate found"
+    ui_line "${prefix} ${pkg} -> WARN (no APT candidate)"
     continue
   fi
 
   if dpkg-query -W -f='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -qx "installed"; then
     inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
     if [[ "$inst_ver" == "$candidate" ]]; then
-      echo "[SKIP] $pkg ($inst_ver) is already up to date"
       skipped_count=$((skipped_count + 1))
+      log_event "SKIP" "$pkg ($inst_ver)"
+      ui_line "${prefix} ${pkg} -> SKIP (${inst_ver})"
       continue
     fi
 
+    cfg_note=""
     if [[ "$flag" == "backup" ]]; then
-      backup_tool_config "$pkg"
+      if (( DRY_RUN == 1 )); then
+        cfg_note=" + cfg-backup(dry-run)"
+        backed_up_count=$((backed_up_count + 1))
+        log_event "CFG-BACKUP" "$pkg (dry-run)"
+      else
+        if backup_tool_config "$pkg"; then
+          cfg_note=" + cfg-backed-up"
+          backed_up_count=$((backed_up_count + 1))
+        fi
+      fi
     fi
 
-    echo "[UPGRADE] $pkg: $inst_ver -> $candidate"
-    apt-get install --only-upgrade -y "$pkg"
-    upgraded_count=$((upgraded_count + 1))
+    if (( DRY_RUN == 1 )); then
+      upgraded_count=$((upgraded_count + 1))
+      log_event "UPGRADE" "$pkg: $inst_ver -> $candidate (dry-run)"
+      ui_line "${prefix} ${pkg} -> WOULD UPGRADE (${inst_ver} -> ${candidate})${cfg_note}"
+      continue
+    fi
+
+    if run_apt_quiet "$pkg" install --only-upgrade -y "$pkg"; then
+      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
+      upgraded_count=$((upgraded_count + 1))
+      log_event "UPGRADE" "$pkg: $inst_ver -> $candidate (${dur})"
+      ui_line "${prefix} ${pkg} -> UPGRADED (${inst_ver} -> ${candidate}, ${dur})${cfg_note}"
+    else
+      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
+      failed_count=$((failed_count + 1))
+      log_event "FAIL" "upgrade $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}.log"
+      ui_line "${prefix} ${pkg} -> FAIL upgrade (${dur}) [log: ${PKG_LOG_DIR}/${pkg}.log]"
+    fi
   else
-    echo "[INSTALL] $pkg ($candidate)"
-    apt-get install -y "$pkg"
-    installed_count=$((installed_count + 1))
+    if (( DRY_RUN == 1 )); then
+      installed_count=$((installed_count + 1))
+      log_event "INSTALL" "$pkg ($candidate) (dry-run)"
+      ui_line "${prefix} ${pkg} -> WOULD INSTALL (${candidate})"
+      continue
+    fi
+
+    if run_apt_quiet "$pkg" install -y "$pkg"; then
+      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
+      installed_count=$((installed_count + 1))
+      log_event "INSTALL" "$pkg ($candidate) (${dur})"
+      ui_line "${prefix} ${pkg} -> INSTALLED (${candidate}, ${dur})"
+    else
+      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
+      failed_count=$((failed_count + 1))
+      log_event "FAIL" "install $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}.log"
+      ui_line "${prefix} ${pkg} -> FAIL install (${dur}) [log: ${PKG_LOG_DIR}/${pkg}.log]"
+    fi
   fi
-done < "$TMP_LIST"
+done < "$PARSED_LIST"
+
+total_elapsed="$(format_elapsed $(( $(date +%s) - START_EPOCH )))"
 
 echo ""
-echo "Summary: installed=${installed_count}, upgraded=${upgraded_count}, skipped=${skipped_count}, warnings=${warned_count}"
+ui_line "=== IRup Summary (${total_elapsed}) ==="
+ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
+ui_line "Events log: ${EVENTS_LOG}"
+ui_line "Full log:   ${FULL_LOG} (symlink: ${LATEST_LINK})"
+
+if (( failed_count > 0 )); then
+  exit 1
+fi
