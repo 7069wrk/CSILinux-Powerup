@@ -61,7 +61,7 @@ parole
 pdfresurrect
 pocketsphinx
 pocketsphinx-en-us
-pygraphviz
+python3-pygraphviz
 recoverdm
 recoverjpeg
 regripper
