@@ -1,0 +1,10 @@
+discord
+hexchat
+linphone
+linphone-desktop
+pidgin
+qtox
+signal-desktop
+slack
+telegram-desktop
+zoom
