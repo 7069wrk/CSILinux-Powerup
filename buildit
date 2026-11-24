@@ -1,366 +1,311 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u
+set -o pipefail
 
-DEFAULT_URL="https://raw.githubusercontent.com/7069wrk/CSILinux-Powerup/79942af21517cd96dbc59148b4adc18dd20d3ff9/csi_ir.txt"
-LOCAL_FALLBACK="./csi_ir.txt"
-BACKUP_ROOT="/var/backups/ir-configs"
-LOG_ROOT="/var/log/irup"
-MANIFEST_URL="$DEFAULT_URL"
+BRANCH="main"
+PROFILES_URL="https://raw.githubusercontent.com/7069wrk/CSILinux-Powerup/${BRANCH}/profiles.conf"
+LOCAL_PROFILES_FALLBACK="./profiles.conf"
+
+LOG_BASE="/var/log/buildit/runs"
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="${LOG_BASE}/${RUN_ID}"
+PKG_LOG_DIR="${RUN_DIR}/packages"
+EVENTS_LOG="${RUN_DIR}/events.log"
+FULL_LOG="${RUN_DIR}/full.log"
+LATEST_LINK="/var/log/buildit/latest.log"
+
 DRY_RUN=0
 REMOVE_MODE=0
-SKIP_PKGS=""
+PROFILE=""
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --url)
-      MANIFEST_URL="${2:-}"
-      [[ -n "$MANIFEST_URL" ]] || { echo "--url requires a value" >&2; exit 1; }
-      shift 2
-      ;;
-    --fallback)
-      LOCAL_FALLBACK="${2:-}"
-      [[ -n "$LOCAL_FALLBACK" ]] || { echo "--fallback requires a value" >&2; exit 1; }
-      shift 2
-      ;;
-    --skip)
-      SKIP_PKGS="${2:-}"
-      [[ -n "$SKIP_PKGS" ]] || { echo "--skip requires a comma-separated package list" >&2; exit 1; }
-      shift 2
-      ;;
-    --remove)
-      REMOVE_MODE=1
-      shift 1
-      ;;
-    --dry-run)
-      DRY_RUN=1
-      shift 1
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      exit 1
-      ;;
-  esac
-done
+MANIFEST_URL=""
+LOCAL_FALLBACK=""
+BACKUP_ROOT=""
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Please run as root or with sudo." >&2
-  exit 1
-fi
-
-RUN_ID="$(date +%Y%m%d-%H%M%S)"
-RUN_DIR="${LOG_ROOT}/runs/${RUN_ID}"
-PKG_LOG_DIR="${RUN_DIR}/packages"
-FULL_LOG="${RUN_DIR}/irup-${RUN_ID}.log"
-EVENTS_LOG="${RUN_DIR}/events-${RUN_ID}.log"
-
-mkdir -p "$PKG_LOG_DIR" "$BACKUP_ROOT"
-touch "$FULL_LOG" "$EVENTS_LOG"
-
-START_EPOCH="$(date +%s)"
+COUNT_INSTALLED=0
+COUNT_UPGRADED=0
+COUNT_CURRENT=0
+COUNT_SKIPPED=0
+COUNT_BACKUPS=0
+COUNT_WARNINGS=0
+COUNT_FAILURES=0
 
 log_event() {
-  local level="${1:-INFO}"
-  local msg="${2:-}"
+  local level="$1"
+  local msg="$2"
   local ts
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  echo "[$ts] [$level] $msg" >> "$EVENTS_LOG"
-  echo "[$ts] [$level] $msg" >> "$FULL_LOG"
+  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" | tee -a "$EVENTS_LOG" "$FULL_LOG" >/dev/null
 }
 
-ui_line() {
-  local line="${1:-}"
-  echo "$line"
-  echo "$line" >> "$EVENTS_LOG"
+log_full() {
+  printf '%s\n' "$*" >> "$FULL_LOG"
 }
 
-format_elapsed() {
-  local sec="${1:-0}"
-  local mins=$((sec / 60))
-  local rem=$((sec % 60))
-  if (( mins > 0 )); then
-    printf "%dm%02ds" "$mins" "$rem"
-  else
-    printf "%ds" "$rem"
+expand_branch() {
+  local raw="$1"
+  printf '%s\n' "${raw//\$\{BRANCH\}/$BRANCH}"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        shift 1
+        ;;
+      --remove)
+        REMOVE_MODE=1
+        shift 1
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: buildit <profile> [--dry-run] [--remove]
+
+Examples:
+  buildit csi-ir --dry-run
+  buildit --remove csi-ma
+EOF
+        exit 0
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+      *)
+        if [[ -n "$PROFILE" ]]; then
+          echo "Unexpected extra argument: $1" >&2
+          exit 1
+        fi
+        PROFILE="$1"
+        shift 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$PROFILE" ]]; then
+    echo "Usage: buildit <profile> [--dry-run] [--remove]" >&2
+    exit 1
   fi
 }
 
-is_user_skipped() {
-  local target_pkg="$1"
-  [[ -z "${SKIP_PKGS:-}" ]] && return 1
-  local item
-  IFS=',' read -ra skip_arr <<< "$SKIP_PKGS"
-  for item in "${skip_arr[@]+${skip_arr[@]}}"; do
-    item="$(echo "$item" | xargs)"
-    [[ -n "$item" && "$item" == "$target_pkg" ]] && return 0
-  done
+fetch_profiles_conf() {
+  local tmp_conf="$1"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL "$PROFILES_URL" -o "$tmp_conf" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  if [[ -f "$LOCAL_PROFILES_FALLBACK" ]]; then
+    cp "$LOCAL_PROFILES_FALLBACK" "$tmp_conf"
+    return 0
+  fi
+
   return 1
 }
 
-is_pkg_installed() {
-  dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null | grep -qx "installed"
-}
+load_profile() {
+  local target="$1"
+  local tmp_conf line name url fallback backup
 
-get_cfg_paths() {
-  case "${1:-}" in
-    ufw|gufw) echo "/etc/ufw" ;;
-    lynis) echo "/etc/lynis" ;;
-    rkhunter) echo "/etc/rkhunter.conf /etc/rkhunter.conf.local" ;;
-    chkrootkit) echo "/etc/chkrootkit.conf" ;;
-    clamav|clamtk) echo "/etc/clamav" ;;
-    wireshark) echo "/etc/wireshark" ;;
-    *) echo "" ;;
-  esac
-}
+  tmp_conf="$(mktemp)"
+  trap 'rm -f "$tmp_conf"' RETURN
 
-backup_tool_config() {
-  local pkg="$1"
-  local dest="${BACKUP_ROOT}/${pkg}/${RUN_ID}"
-  local paths
-  paths="$(get_cfg_paths "$pkg")"
-
-  if [[ -z "$paths" ]]; then
-    log_event "CFG-SKIP" "$pkg: no config paths mapped"
+  if ! fetch_profiles_conf "$tmp_conf"; then
+    echo "Unable to fetch remote profiles.conf and no local fallback found at $LOCAL_PROFILES_FALLBACK" >&2
     return 1
   fi
 
-  mkdir -p "$dest"
-  local backed_up=0
-  local p
-  for p in $paths; do
-    if [[ -e "$p" ]]; then
-      cp -a "$p" "$dest/" >> "$FULL_LOG" 2>&1
-      backed_up=1
-    fi
-  done
+  line="$(awk -F'|' -v p="$target" '
+    /^[[:space:]]*(#|$)/ { next }
+    $1 == p { print $0; exit }
+  ' "$tmp_conf")"
 
-  if [[ "$backed_up" -eq 1 ]]; then
-    log_event "CFG-BACKUP" "$pkg -> $dest"
+  if [[ -z "$line" ]]; then
+    echo "Profile not found in profiles.conf: $target" >&2
+    return 1
+  fi
+
+  IFS='|' read -r name url fallback backup <<< "$line"
+  MANIFEST_URL="$(expand_branch "$url")"
+  LOCAL_FALLBACK="$(expand_branch "$fallback")"
+  BACKUP_ROOT="$(expand_branch "$backup")"
+
+  if [[ -z "$MANIFEST_URL" || -z "$LOCAL_FALLBACK" || -z "$BACKUP_ROOT" ]]; then
+    echo "Incomplete profile entry for '$target': expected profile|url|fallback|backup_root" >&2
+    return 1
+  fi
+}
+
+resolve_manifest() {
+  local out_file="$1"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL "$MANIFEST_URL" -o "$out_file" 2>/dev/null; then
+      log_event "INFO" "Loaded manifest from remote: $MANIFEST_URL"
+      return 0
+    fi
+  fi
+
+  if [[ -f "$LOCAL_FALLBACK" ]]; then
+    cp "$LOCAL_FALLBACK" "$out_file"
+    log_event "WARN" "Remote manifest unavailable; using local fallback: $LOCAL_FALLBACK"
+    COUNT_WARNINGS=$((COUNT_WARNINGS + 1))
     return 0
+  fi
+
+  log_event "ERROR" "Failed to retrieve manifest from $MANIFEST_URL or $LOCAL_FALLBACK"
+  return 1
+}
+
+process_package() {
+  local idx="$1"
+  local total="$2"
+  local pkg="$3"
+  local pkg_log="${PKG_LOG_DIR}/${pkg}.log"
+  local pct=$((idx * 100 / total))
+  local status_cmd_rc=0
+
+  if [[ "$REMOVE_MODE" -eq 1 ]]; then
+    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '[%d/%d | %3d%%] %s -> DRY-RUN remove\n' "$idx" "$total" "$pct" "$pkg"
+        log_event "DRY-RUN" "Would remove $pkg"
+        COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
+      else
+        if DEBIAN_FRONTEND=noninteractive apt-get remove -y "$pkg" >"$pkg_log" 2>&1; then
+          printf '[%d/%d | %3d%%] %s -> REMOVED\n' "$idx" "$total" "$pct" "$pkg"
+          log_event "INFO" "Removed $pkg (log: $pkg_log)"
+          COUNT_INSTALLED=$((COUNT_INSTALLED + 1))
+        else
+          printf '[%d/%d | %3d%%] %s -> FAIL remove [log: %s]\n' "$idx" "$total" "$pct" "$pkg" "$pkg_log"
+          log_event "ERROR" "Failed removing $pkg (log: $pkg_log)"
+          COUNT_FAILURES=$((COUNT_FAILURES + 1))
+        fi
+      fi
+    else
+      printf '[%d/%d | %3d%%] %s -> SKIPPED (not installed)\n' "$idx" "$total" "$pct" "$pkg"
+      COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
+    fi
+    return 0
+  fi
+
+  if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+    local candidate installed_ver
+    installed_ver="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
+    candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+
+    if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+      printf '[%d/%d | %3d%%] %s -> WARN (no APT candidate, installed %s)\n' "$idx" "$total" "$pct" "$pkg" "$installed_ver"
+      log_event "WARN" "$pkg has no APT candidate (installed: $installed_ver)"
+      COUNT_WARNINGS=$((COUNT_WARNINGS + 1))
+      return 0
+    fi
+
+    if [[ "$installed_ver" == "$candidate" ]]; then
+      printf '[%d/%d | %3d%%] %s -> CURRENT (%s)\n' "$idx" "$total" "$pct" "$pkg" "$installed_ver"
+      log_full "$pkg is current at $installed_ver"
+      COUNT_CURRENT=$((COUNT_CURRENT + 1))
+      return 0
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf '[%d/%d | %3d%%] %s -> DRY-RUN upgrade (%s -> %s)\n' "$idx" "$total" "$pct" "$pkg" "$installed_ver" "$candidate"
+      log_event "DRY-RUN" "Would upgrade $pkg from $installed_ver to $candidate"
+      COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
+      return 0
+    fi
+
+    if DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "$pkg" >"$pkg_log" 2>&1; then
+      printf '[%d/%d | %3d%%] %s -> UPGRADED (%s)\n' "$idx" "$total" "$pct" "$pkg" "$candidate"
+      log_event "INFO" "Upgraded $pkg to $candidate (log: $pkg_log)"
+      COUNT_UPGRADED=$((COUNT_UPGRADED + 1))
+    else
+      printf '[%d/%d | %3d%%] %s -> FAIL upgrade [log: %s]\n' "$idx" "$total" "$pct" "$pkg" "$pkg_log"
+      log_event "ERROR" "Failed upgrading $pkg (log: $pkg_log)"
+      COUNT_FAILURES=$((COUNT_FAILURES + 1))
+    fi
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '[%d/%d | %3d%%] %s -> DRY-RUN install\n' "$idx" "$total" "$pct" "$pkg"
+    log_event "DRY-RUN" "Would install $pkg"
+    COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
+    return 0
+  fi
+
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >"$pkg_log" 2>&1; then
+    printf '[%d/%d | %3d%%] %s -> INSTALLED\n' "$idx" "$total" "$pct" "$pkg"
+    log_event "INFO" "Installed $pkg (log: $pkg_log)"
+    COUNT_INSTALLED=$((COUNT_INSTALLED + 1))
   else
-    rmdir "$dest" 2>/dev/null || true
-    log_event "CFG-SKIP" "$pkg: mapped config paths not present on disk"
-    return 1
+    status_cmd_rc=$?
+    printf '[%d/%d | %3d%%] %s -> FAIL install (rc=%d) [log: %s]\n' "$idx" "$total" "$pct" "$pkg" "$status_cmd_rc" "$pkg_log"
+    log_event "ERROR" "Failed installing $pkg (rc=$status_cmd_rc, log: $pkg_log)"
+    COUNT_FAILURES=$((COUNT_FAILURES + 1))
   fi
 }
 
-run_apt_quiet() {
-  local pkg="$1"
-  shift
-  local pkg_log="${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
-  {
-    echo "=== COMMAND: DEBIAN_FRONTEND=noninteractive apt-get $* ==="
-    echo "=== TIMESTAMP: $(date '+%Y-%m-%d %H:%M:%S') ==="
-    DEBIAN_FRONTEND=noninteractive apt-get "$@"
-  } > "$pkg_log" 2>&1
-  local rc=$?
-  cat "$pkg_log" >> "$FULL_LOG"
-  return $rc
-}
+main() {
+  local start_ts elapsed active_manifest total_pkgs idx=0 pkg
+  local -a packages=()
 
-TMP_LIST="$(mktemp)"
-PARSED_LIST="$(mktemp)"
-trap 'rm -f "$TMP_LIST" "$PARSED_LIST"' EXIT
+  parse_args "$@"
+  load_profile "$PROFILE"
 
-mode_label="INSTALL/UPGRADE"
-(( REMOVE_MODE == 1 )) && mode_label="REMOVE"
+  mkdir -p "$PKG_LOG_DIR" "$BACKUP_ROOT"
+  : > "$EVENTS_LOG"
+  : > "$FULL_LOG"
+  ln -sfn "$FULL_LOG" "$LATEST_LINK"
 
-ui_line "IRup run started (${RUN_ID}) | Mode: ${mode_label} | Full log: ${FULL_LOG}"
-[[ "$DRY_RUN" -eq 1 ]] && ui_line "Dry-run enabled: no system changes will be made"
-[[ -n "${SKIP_PKGS:-}" ]] && ui_line "User skip list: ${SKIP_PKGS}"
+  start_ts="$(date +%s)"
+  log_event "INFO" "Starting buildit profile='$PROFILE' branch='$BRANCH' dry_run=$DRY_RUN remove=$REMOVE_MODE"
+  log_event "INFO" "Manifest URL: $MANIFEST_URL | Fallback: $LOCAL_FALLBACK | Backup root: $BACKUP_ROOT"
 
-if curl -fsSL --connect-timeout 10 --max-time 30 "$MANIFEST_URL" -o "$TMP_LIST" 2>>"$FULL_LOG" && grep -qvE '^\s*(#|$)' "$TMP_LIST"; then
-  log_event "SOURCE" "Loaded manifest from $MANIFEST_URL"
-elif [[ -f "$LOCAL_FALLBACK" ]] && grep -qvE '^\s*(#|$)' "$LOCAL_FALLBACK"; then
-  log_event "WARN" "Remote fetch failed; falling back to $LOCAL_FALLBACK"
-  cp "$LOCAL_FALLBACK" "$TMP_LIST"
-else
-  log_event "ERROR" "Could not load valid manifest from remote URL or local fallback."
-  echo "[ERROR] Failed to load manifest. See $FULL_LOG" >&2
-  exit 1
-fi
+  active_manifest="$(mktemp)"
+  trap 'rm -f "$active_manifest"' EXIT
 
-while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-  clean="${raw_line%%#*}"
-  clean="$(echo "$clean" | xargs)"
-  [[ -z "$clean" ]] && continue
-  pkg="$(echo "$clean" | awk '{print $1}')"
-  flag="$(echo "$clean" | awk '{print $2}')"
-  printf "%s\t%s\n" "$pkg" "${flag:-}" >> "$PARSED_LIST"
-done < "$TMP_LIST"
+  if ! resolve_manifest "$active_manifest"; then
+    exit 1
+  fi
 
-total_pkgs="$(wc -l < "$PARSED_LIST" | xargs)"
-if (( total_pkgs == 0 )); then
-  echo "[ERROR] Manifest contained 0 valid packages." >&2
-  exit 1
-fi
-
-export DEBIAN_FRONTEND=noninteractive
-
-if (( REMOVE_MODE == 0 )); then
-  ui_line "[00/${total_pkgs} |   0%] Refreshing APT package index..."
-  if (( DRY_RUN == 1 )); then
-    apt-get update >> "$FULL_LOG" 2>&1 || true
-  else
-    if ! apt-get update >> "$FULL_LOG" 2>&1; then
+  if [[ "$DRY_RUN" -eq 0 && "$REMOVE_MODE" -eq 0 ]]; then
+    apt-get update >>"$FULL_LOG" 2>&1 || {
       log_event "ERROR" "apt-get update failed"
-      echo "[FAIL] apt-get update failed — see $FULL_LOG" >&2
-      exit 1
-    fi
-  fi
-fi
-
-idx=0
-installed_count=0
-upgraded_count=0
-removed_count=0
-absent_count=0
-current_count=0
-skipped_count=0
-backed_up_count=0
-warned_count=0
-failed_count=0
-
-while IFS=$'\t' read -r pkg flag; do
-  flag="${flag:-}"
-  idx=$((idx + 1))
-  pct=$((idx * 100 / total_pkgs))
-  prefix="$(printf "[%02d/%02d | %3d%%]" "$idx" "$total_pkgs" "$pct")"
-  pkg_start="$(date +%s)"
-
-  if is_user_skipped "$pkg"; then
-    skipped_count=$((skipped_count + 1))
-    log_event "SKIPPED" "$pkg (user skip list)"
-    ui_line "${prefix} ${pkg} -> SKIPPED (user filter)"
-    continue
+      COUNT_FAILURES=$((COUNT_FAILURES + 1))
+    }
   fi
 
-  if (( REMOVE_MODE == 1 )); then
-    if ! is_pkg_installed "$pkg"; then
-      absent_count=$((absent_count + 1))
-      log_event "ABSENT" "$pkg (not installed)"
-      ui_line "${prefix} ${pkg} -> ABSENT"
-      continue
-    fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | xargs)"
+    [[ -n "$line" ]] && packages+=("$line")
+  done < "$active_manifest"
 
-    inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
-    cfg_note=""
-    if [[ "$flag" == "backup" ]]; then
-      if (( DRY_RUN == 1 )); then
-        cfg_note=" + cfg-backup(dry-run)"
-        backed_up_count=$((backed_up_count + 1))
-        log_event "CFG-BACKUP" "$pkg (dry-run)"
-      else
-        if backup_tool_config "$pkg"; then
-          cfg_note=" + cfg-backed-up"
-          backed_up_count=$((backed_up_count + 1))
-        fi
-      fi
-    fi
-
-    if (( DRY_RUN == 1 )); then
-      removed_count=$((removed_count + 1))
-      log_event "REMOVE" "$pkg ($inst_ver) (dry-run)"
-      ui_line "${prefix} ${pkg} -> WOULD REMOVE (${inst_ver})${cfg_note:-}"
-      continue
-    fi
-
-    if run_apt_quiet "$pkg" remove -y "$pkg"; then
-      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
-      removed_count=$((removed_count + 1))
-      log_event "REMOVE" "$pkg ($inst_ver) (${dur})"
-      ui_line "${prefix} ${pkg} -> REMOVED (${inst_ver}, ${dur})${cfg_note:-}"
-    else
-      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
-      failed_count=$((failed_count + 1))
-      log_event "FAIL" "remove $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
-      ui_line "${prefix} ${pkg} -> FAIL remove (${dur}) [log: ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log]"
-    fi
-    continue
-  fi
-
-  candidate="$(apt-cache policy "$pkg" 2>>"$FULL_LOG" | awk '/Candidate:/ {print $2}')"
-  if [[ -z "${candidate:-}" || "$candidate" == "(none)" ]]; then
-    warned_count=$((warned_count + 1))
-    log_event "WARN" "$pkg: no APT candidate found"
-    ui_line "${prefix} ${pkg} -> WARN (no APT candidate)"
-    continue
-  fi
-
-  if is_pkg_installed "$pkg"; then
-    inst_ver="$(dpkg-query -W -f='${Version}\n' "$pkg")"
-    if [[ "$inst_ver" == "$candidate" ]]; then
-      current_count=$((current_count + 1))
-      log_event "CURRENT" "$pkg ($inst_ver)"
-      ui_line "${prefix} ${pkg} -> CURRENT (${inst_ver})"
-      continue
-    fi
-
-    cfg_note=""
-    if [[ "$flag" == "backup" ]]; then
-      if (( DRY_RUN == 1 )); then
-        cfg_note=" + cfg-backup(dry-run)"
-        backed_up_count=$((backed_up_count + 1))
-        log_event "CFG-BACKUP" "$pkg (dry-run)"
-      else
-        if backup_tool_config "$pkg"; then
-          cfg_note=" + cfg-backed-up"
-          backed_up_count=$((backed_up_count + 1))
-        fi
-      fi
-    fi
-
-    if (( DRY_RUN == 1 )); then
-      upgraded_count=$((upgraded_count + 1))
-      log_event "UPGRADE" "$pkg: $inst_ver -> $candidate (dry-run)"
-      ui_line "${prefix} ${pkg} -> WOULD UPGRADE (${inst_ver} -> ${candidate})${cfg_note:-}"
-      continue
-    fi
-
-    if run_apt_quiet "$pkg" install --only-upgrade -y "$pkg"; then
-      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
-      upgraded_count=$((upgraded_count + 1))
-      log_event "UPGRADE" "$pkg: $inst_ver -> $candidate (${dur})"
-      ui_line "${prefix} ${pkg} -> UPGRADED (${inst_ver} -> ${candidate}, ${dur})${cfg_note:-}"
-    else
-      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
-      failed_count=$((failed_count + 1))
-      log_event "FAIL" "upgrade $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
-      ui_line "${prefix} ${pkg} -> FAIL upgrade (${dur}) [log: ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log]"
-    fi
+  total_pkgs="${#packages[@]}"
+  if [[ "$total_pkgs" -eq 0 ]]; then
+    log_event "WARN" "No packages found in manifest for profile '$PROFILE'"
+    COUNT_WARNINGS=$((COUNT_WARNINGS + 1))
   else
-    if (( DRY_RUN == 1 )); then
-      installed_count=$((installed_count + 1))
-      log_event "INSTALL" "$pkg ($candidate) (dry-run)"
-      ui_line "${prefix} ${pkg} -> WOULD INSTALL (${candidate})"
-      continue
-    fi
-
-    if run_apt_quiet "$pkg" install -y "$pkg"; then
-      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
-      installed_count=$((installed_count + 1))
-      log_event "INSTALL" "$pkg ($candidate) (${dur})"
-      ui_line "${prefix} ${pkg} -> INSTALLED (${candidate}, ${dur})"
-    else
-      dur="$(format_elapsed $(( $(date +%s) - pkg_start )))"
-      failed_count=$((failed_count + 1))
-      log_event "FAIL" "install $pkg (${dur}) — see ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log"
-      ui_line "${prefix} ${pkg} -> FAIL install (${dur}) [log: ${PKG_LOG_DIR}/${pkg}-${RUN_ID}.log]"
-    fi
+    for pkg in "${packages[@]}"; do
+      idx=$((idx + 1))
+      process_package "$idx" "$total_pkgs" "$pkg"
+    done
   fi
-done < "$PARSED_LIST"
 
-total_elapsed="$(format_elapsed $(( $(date +%s) - START_EPOCH )))"
+  elapsed=$(( $(date +%s) - start_ts ))
 
-echo ""
-ui_line "=== IRup Summary (${total_elapsed}) ==="
-if (( REMOVE_MODE == 1 )); then
-  ui_line "Removed: ${removed_count} | Absent: ${absent_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Failures: ${failed_count}"
-else
-  ui_line "Installed: ${installed_count} | Upgraded: ${upgraded_count} | Current: ${current_count} | Skipped: ${skipped_count} | Config Backups: ${backed_up_count} | Warnings: ${warned_count} | Failures: ${failed_count}"
-fi
-ui_line "Events log: ${EVENTS_LOG}"
-ui_line "Full log:   ${FULL_LOG}"
+  cat <<EOF
 
-if (( failed_count > 0 )); then
-  exit 1
-fi
+=== buildit Summary (${elapsed}s) ===
+Profile:   $PROFILE (branch: $BRANCH)
+Installed: $COUNT_INSTALLED | Upgraded: $COUNT_UPGRADED | Current: $COUNT_CURRENT | Skipped: $COUNT_SKIPPED | Config Backups: $COUNT_BACKUPS | Warnings: $COUNT_WARNINGS | Failures: $COUNT_FAILURES
+Events log: $EVENTS_LOG
+Full log:   $FULL_LOG (symlink: $LATEST_LINK)
+EOF
+
+  [[ "$COUNT_FAILURES" -eq 0 ]]
+}
+
+main "$@"
