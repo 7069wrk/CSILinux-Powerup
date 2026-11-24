@@ -1,50 +1,52 @@
 #!/usr/bin/env bash
-set -u
-set -o pipefail
+set -euo pipefail
 
-BRANCH="main"
+BRANCH="${BRANCH:-main}"
 PROFILES_URL="https://raw.githubusercontent.com/7069wrk/CSILinux-Powerup/${BRANCH}/profiles.conf"
-LOCAL_PROFILES_FALLBACK="./profiles.conf"
+LOCAL_PROFILES="${LOCAL_PROFILES:-./profiles.conf}"
 
-LOG_BASE="/var/log/buildit/runs"
+LOG_ROOT="/var/log/buildit"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
-RUN_DIR="${LOG_BASE}/${RUN_ID}"
-PKG_LOG_DIR="${RUN_DIR}/packages"
-EVENTS_LOG="${RUN_DIR}/events.log"
-FULL_LOG="${RUN_DIR}/full.log"
-LATEST_LINK="/var/log/buildit/latest.log"
+RUN_DIR="${LOG_ROOT}/runs/${RUN_ID}"
+LOG_FILE="${RUN_DIR}/full.log"
 
 DRY_RUN=0
-REMOVE_MODE=0
 PROFILE=""
 
-MANIFEST_URL=""
-LOCAL_FALLBACK=""
-BACKUP_ROOT=""
+tmp_conf=""
+tmp_manifest=""
 
-COUNT_INSTALLED=0
-COUNT_UPGRADED=0
-COUNT_CURRENT=0
-COUNT_SKIPPED=0
-COUNT_BACKUPS=0
-COUNT_WARNINGS=0
-COUNT_FAILURES=0
+cleanup() {
+  local exit_code=$?
+  if [[ -n "${tmp_conf:-}" && -f "${tmp_conf:-}" ]]; then
+    rm -f "$tmp_conf"
+  fi
+  if [[ -n "${tmp_manifest:-}" && -f "${tmp_manifest:-}" ]]; then
+    rm -f "$tmp_manifest"
+  fi
+  exit "$exit_code"
+}
+trap cleanup EXIT
 
-log_event() {
+usage() {
+  cat <<'EOF'
+Usage: buildit <profile> [--dry-run]
+       buildit --dry-run <profile>
+
+Options:
+  --dry-run   Validate manifest and simulate APT actions without installing
+  -h, --help  Show this help message
+EOF
+}
+
+log_msg() {
   local level="$1"
-  local msg="$2"
-  local ts
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" | tee -a "$EVENTS_LOG" "$FULL_LOG" >/dev/null
-}
-
-log_full() {
-  printf '%s\n' "$*" >> "$FULL_LOG"
-}
-
-expand_branch() {
-  local raw="$1"
-  printf '%s\n' "${raw//\$\{BRANCH\}/$BRANCH}"
+  shift
+  local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*"
+  echo "$msg"
+  if [[ -n "${LOG_FILE:-}" && -f "${LOG_FILE:-}" ]]; then
+    echo "$msg" >> "$LOG_FILE"
+  fi
 }
 
 parse_args() {
@@ -52,260 +54,185 @@ parse_args() {
     case "$1" in
       --dry-run)
         DRY_RUN=1
-        shift 1
-        ;;
-      --remove)
-        REMOVE_MODE=1
-        shift 1
+        shift
         ;;
       -h|--help)
-        cat <<'EOF'
-Usage: buildit <profile> [--dry-run] [--remove]
-
-Examples:
-  buildit csi-ir --dry-run
-  buildit --remove csi-ma
-EOF
+        usage
         exit 0
         ;;
       -*)
         echo "Unknown option: $1" >&2
+        usage >&2
         exit 1
         ;;
       *)
-        if [[ -n "$PROFILE" ]]; then
-          echo "Unexpected extra argument: $1" >&2
+        if [[ -z "$PROFILE" ]]; then
+          PROFILE="$1"
+        else
+          echo "Unexpected argument: $1" >&2
+          usage >&2
           exit 1
         fi
-        PROFILE="$1"
-        shift 1
+        shift
         ;;
     esac
   done
 
   if [[ -z "$PROFILE" ]]; then
-    echo "Usage: buildit <profile> [--dry-run] [--remove]" >&2
+    echo "ERROR: Profile is required." >&2
+    usage >&2
     exit 1
   fi
 }
 
-fetch_profiles_conf() {
-  local tmp_conf="$1"
+init_logging() {
+  mkdir -p "$RUN_DIR"
+  : > "$LOG_FILE"
+  mkdir -p "$LOG_ROOT"
+  ln -sfn "$LOG_FILE" "${LOG_ROOT}/latest.log"
+  log_msg "INFO" "Run ID: $RUN_ID | Branch: $BRANCH | Dry-run: $DRY_RUN"
+  log_msg "INFO" "Full log: $LOG_FILE"
+}
+
+fetch_file() {
+  local url="$1"
+  local dest="$2"
+
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL "$PROFILES_URL" -o "$tmp_conf" 2>/dev/null; then
-      return 0
-    fi
-  fi
-
-  if [[ -f "$LOCAL_PROFILES_FALLBACK" ]]; then
-    cp "$LOCAL_PROFILES_FALLBACK" "$tmp_conf"
-    return 0
-  fi
-
-  return 1
-}
-
-load_profile() {
-  local target="$1"
-  local tmp_conf line name url fallback backup
-
-  tmp_conf="$(mktemp)"
-  trap 'rm -f "$tmp_conf"' RETURN
-
-  if ! fetch_profiles_conf "$tmp_conf"; then
-    echo "Unable to fetch remote profiles.conf and no local fallback found at $LOCAL_PROFILES_FALLBACK" >&2
-    return 1
-  fi
-
-  line="$(awk -F'|' -v p="$target" '
-    /^[[:space:]]*(#|$)/ { next }
-    $1 == p { print $0; exit }
-  ' "$tmp_conf")"
-
-  if [[ -z "$line" ]]; then
-    echo "Profile not found in profiles.conf: $target" >&2
-    return 1
-  fi
-
-  IFS='|' read -r name url fallback backup <<< "$line"
-  MANIFEST_URL="$(expand_branch "$url")"
-  LOCAL_FALLBACK="$(expand_branch "$fallback")"
-  BACKUP_ROOT="$(expand_branch "$backup")"
-
-  if [[ -z "$MANIFEST_URL" || -z "$LOCAL_FALLBACK" || -z "$BACKUP_ROOT" ]]; then
-    echo "Incomplete profile entry for '$target': expected profile|url|fallback|backup_root" >&2
-    return 1
-  fi
-}
-
-resolve_manifest() {
-  local out_file="$1"
-  if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL "$MANIFEST_URL" -o "$out_file" 2>/dev/null; then
-      log_event "INFO" "Loaded manifest from remote: $MANIFEST_URL"
-      return 0
-    fi
-  fi
-
-  if [[ -f "$LOCAL_FALLBACK" ]]; then
-    cp "$LOCAL_FALLBACK" "$out_file"
-    log_event "WARN" "Remote manifest unavailable; using local fallback: $LOCAL_FALLBACK"
-    COUNT_WARNINGS=$((COUNT_WARNINGS + 1))
-    return 0
-  fi
-
-  log_event "ERROR" "Failed to retrieve manifest from $MANIFEST_URL or $LOCAL_FALLBACK"
-  return 1
-}
-
-process_package() {
-  local idx="$1"
-  local total="$2"
-  local pkg="$3"
-  local pkg_log="${PKG_LOG_DIR}/${pkg}.log"
-  local pct=$((idx * 100 / total))
-  local status_cmd_rc=0
-
-  if [[ "$REMOVE_MODE" -eq 1 ]]; then
-    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-      if [[ "$DRY_RUN" -eq 1 ]]; then
-        printf '[%d/%d | %3d%%] %s -> DRY-RUN remove\n' "$idx" "$total" "$pct" "$pkg"
-        log_event "DRY-RUN" "Would remove $pkg"
-        COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-      else
-        if DEBIAN_FRONTEND=noninteractive apt-get remove -y "$pkg" >"$pkg_log" 2>&1; then
-          printf '[%d/%d | %3d%%] %s -> REMOVED\n' "$idx" "$total" "$pct" "$pkg"
-          log_event "INFO" "Removed $pkg (log: $pkg_log)"
-          COUNT_INSTALLED=$((COUNT_INSTALLED + 1))
-        else
-          printf '[%d/%d | %3d%%] %s -> FAIL remove [log: %s]\n' "$idx" "$total" "$pct" "$pkg" "$pkg_log"
-          log_event "ERROR" "Failed removing $pkg (log: $pkg_log)"
-          COUNT_FAILURES=$((COUNT_FAILURES + 1))
-        fi
-      fi
-    else
-      printf '[%d/%d | %3d%%] %s -> SKIPPED (not installed)\n' "$idx" "$total" "$pct" "$pkg"
-      COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-    fi
-    return 0
-  fi
-
-  if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-    local candidate installed_ver
-    installed_ver="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
-    candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
-
-    if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
-      printf '[%d/%d | %3d%%] %s -> WARN (no APT candidate, installed %s)\n' "$idx" "$total" "$pct" "$pkg" "$installed_ver"
-      log_event "WARN" "$pkg has no APT candidate (installed: $installed_ver)"
-      COUNT_WARNINGS=$((COUNT_WARNINGS + 1))
-      return 0
-    fi
-
-    if [[ "$installed_ver" == "$candidate" ]]; then
-      printf '[%d/%d | %3d%%] %s -> CURRENT (%s)\n' "$idx" "$total" "$pct" "$pkg" "$installed_ver"
-      log_full "$pkg is current at $installed_ver"
-      COUNT_CURRENT=$((COUNT_CURRENT + 1))
-      return 0
-    fi
-
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      printf '[%d/%d | %3d%%] %s -> DRY-RUN upgrade (%s -> %s)\n' "$idx" "$total" "$pct" "$pkg" "$installed_ver" "$candidate"
-      log_event "DRY-RUN" "Would upgrade $pkg from $installed_ver to $candidate"
-      COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-      return 0
-    fi
-
-    if DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "$pkg" >"$pkg_log" 2>&1; then
-      printf '[%d/%d | %3d%%] %s -> UPGRADED (%s)\n' "$idx" "$total" "$pct" "$pkg" "$candidate"
-      log_event "INFO" "Upgraded $pkg to $candidate (log: $pkg_log)"
-      COUNT_UPGRADED=$((COUNT_UPGRADED + 1))
-    else
-      printf '[%d/%d | %3d%%] %s -> FAIL upgrade [log: %s]\n' "$idx" "$total" "$pct" "$pkg" "$pkg_log"
-      log_event "ERROR" "Failed upgrading $pkg (log: $pkg_log)"
-      COUNT_FAILURES=$((COUNT_FAILURES + 1))
-    fi
-    return 0
-  fi
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[%d/%d | %3d%%] %s -> DRY-RUN install\n' "$idx" "$total" "$pct" "$pkg"
-    log_event "DRY-RUN" "Would install $pkg"
-    COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-    return 0
-  fi
-
-  if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >"$pkg_log" 2>&1; then
-    printf '[%d/%d | %3d%%] %s -> INSTALLED\n' "$idx" "$total" "$pct" "$pkg"
-    log_event "INFO" "Installed $pkg (log: $pkg_log)"
-    COUNT_INSTALLED=$((COUNT_INSTALLED + 1))
+    curl -fsSL "$url" -o "$dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url"
   else
-    status_cmd_rc=$?
-    printf '[%d/%d | %3d%%] %s -> FAIL install (rc=%d) [log: %s]\n' "$idx" "$total" "$pct" "$pkg" "$status_cmd_rc" "$pkg_log"
-    log_event "ERROR" "Failed installing $pkg (rc=$status_cmd_rc, log: $pkg_log)"
-    COUNT_FAILURES=$((COUNT_FAILURES + 1))
+    return 1
   fi
 }
 
-main() {
-  local start_ts elapsed active_manifest total_pkgs idx=0 pkg
-  local -a packages=()
+expand_branch() {
+  local raw="$1"
+  printf '%s' "${raw//\$\{BRANCH\}/$BRANCH}"
+}
 
-  parse_args "$@"
-  load_profile "$PROFILE"
+load_profiles_conf() {
+  tmp_conf="$(mktemp /tmp/buildit-profiles.XXXXXX)"
 
-  mkdir -p "$PKG_LOG_DIR" "$BACKUP_ROOT"
-  : > "$EVENTS_LOG"
-  : > "$FULL_LOG"
-  ln -sfn "$FULL_LOG" "$LATEST_LINK"
-
-  start_ts="$(date +%s)"
-  log_event "INFO" "Starting buildit profile='$PROFILE' branch='$BRANCH' dry_run=$DRY_RUN remove=$REMOVE_MODE"
-  log_event "INFO" "Manifest URL: $MANIFEST_URL | Fallback: $LOCAL_FALLBACK | Backup root: $BACKUP_ROOT"
-
-  active_manifest="$(mktemp)"
-  trap 'rm -f "$active_manifest"' EXIT
-
-  if ! resolve_manifest "$active_manifest"; then
-    exit 1
+  if fetch_file "$PROFILES_URL" "$tmp_conf"; then
+    log_msg "INFO" "Loaded profiles.conf from $PROFILES_URL"
+    return 0
   fi
 
-  if [[ "$DRY_RUN" -eq 0 && "$REMOVE_MODE" -eq 0 ]]; then
-    apt-get update >>"$FULL_LOG" 2>&1 || {
-      log_event "ERROR" "apt-get update failed"
-      COUNT_FAILURES=$((COUNT_FAILURES + 1))
-    }
+  if [[ -f "$LOCAL_PROFILES" ]]; then
+    log_msg "WARN" "Remote profiles fetch failed; falling back to $LOCAL_PROFILES"
+    cp "$LOCAL_PROFILES" "$tmp_conf"
+    return 0
   fi
+
+  log_msg "ERROR" "Failed to fetch $PROFILES_URL and local fallback not found at $LOCAL_PROFILES"
+  return 1
+}
+
+lookup_profile() {
+  local target="$1"
+  local line p_name p_url p_local p_backup
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"
     line="$(printf '%s' "$line" | xargs)"
-    [[ -n "$line" ]] && packages+=("$line")
-  done < "$active_manifest"
+    [[ -z "$line" ]] && continue
 
-  total_pkgs="${#packages[@]}"
-  if [[ "$total_pkgs" -eq 0 ]]; then
-    log_event "WARN" "No packages found in manifest for profile '$PROFILE'"
-    COUNT_WARNINGS=$((COUNT_WARNINGS + 1))
-  else
-    for pkg in "${packages[@]}"; do
-      idx=$((idx + 1))
-      process_package "$idx" "$total_pkgs" "$pkg"
-    done
+    IFS='|' read -r p_name p_url p_local p_backup <<< "$line"
+    if [[ "$p_name" == "$target" ]]; then
+      MANIFEST_URL="$(expand_branch "${p_url:-}")"
+      LOCAL_MANIFEST="$(expand_branch "${p_local:-}")"
+      BACKUP_ROOT="$(expand_branch "${p_backup:-}")"
+      return 0
+    fi
+  done < "$tmp_conf"
+
+  return 1
+}
+
+load_manifest() {
+  tmp_manifest="$(mktemp /tmp/buildit-manifest.XXXXXX)"
+
+  if [[ -n "${MANIFEST_URL:-}" ]] && fetch_file "$MANIFEST_URL" "$tmp_manifest"; then
+    log_msg "INFO" "Fetched manifest from $MANIFEST_URL"
+    return 0
   fi
 
-  elapsed=$(( $(date +%s) - start_ts ))
+  if [[ -n "${LOCAL_MANIFEST:-}" && -f "$LOCAL_MANIFEST" ]]; then
+    log_msg "WARN" "Remote manifest fetch failed; falling back to $LOCAL_MANIFEST"
+    cp "$LOCAL_MANIFEST" "$tmp_manifest"
+    return 0
+  fi
 
-  cat <<EOF
+  log_msg "ERROR" "Unable to load manifest for profile '$PROFILE' (url: ${MANIFEST_URL:-none}, local: ${LOCAL_MANIFEST:-none})"
+  return 1
+}
 
-=== buildit Summary (${elapsed}s) ===
-Profile:   $PROFILE (branch: $BRANCH)
-Installed: $COUNT_INSTALLED | Upgraded: $COUNT_UPGRADED | Current: $COUNT_CURRENT | Skipped: $COUNT_SKIPPED | Config Backups: $COUNT_BACKUPS | Warnings: $COUNT_WARNINGS | Failures: $COUNT_FAILURES
-Events log: $EVENTS_LOG
-Full log:   $FULL_LOG (symlink: $LATEST_LINK)
-EOF
+collect_packages() {
+  local line pkg
+  PACKAGES=()
 
-  [[ "$COUNT_FAILURES" -eq 0 ]]
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    pkg="$(printf '%s' "$line" | xargs)"
+    [[ -z "$pkg" ]] && continue
+    PACKAGES+=("$pkg")
+  done < "$tmp_manifest"
+}
+
+run_apt() {
+  if [[ "${#PACKAGES[@]}" -eq 0 ]]; then
+    log_msg "WARN" "No packages found in manifest for profile '$PROFILE'"
+    return 0
+  fi
+
+  log_msg "INFO" "Packages queued (${#PACKAGES[@]}): ${PACKAGES[*]}"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_msg "INFO" "[DRY-RUN] Running apt-get update and simulated install..."
+    apt-get update >> "$LOG_FILE" 2>&1
+    apt-get install -s -y "${PACKAGES[@]}" | tee -a "$LOG_FILE"
+  else
+    log_msg "INFO" "Running apt-get update and install..."
+    apt-get update >> "$LOG_FILE" 2>&1
+    apt-get install -y "${PACKAGES[@]}" | tee -a "$LOG_FILE"
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Please run buildit as root (e.g., sudo bash ./buildit ...)." >&2
+    exit 1
+  fi
+
+  init_logging
+  load_profiles_conf
+
+  MANIFEST_URL=""
+  LOCAL_MANIFEST=""
+  BACKUP_ROOT=""
+
+  if ! lookup_profile "$PROFILE"; then
+    log_msg "ERROR" "Profile not found in profiles.conf: $PROFILE"
+    exit 1
+  fi
+
+  if [[ -z "${BACKUP_ROOT:-}" ]]; then
+    log_msg "ERROR" "Empty backup root for profile '$PROFILE'"
+    exit 1
+  fi
+
+  mkdir -p "$BACKUP_ROOT"
+  log_msg "INFO" "Backup directory ready: $BACKUP_ROOT"
+
+  load_manifest
+  collect_packages
+  run_apt
+
+  log_msg "INFO" "Completed profile '$PROFILE' successfully."
 }
 
 main "$@"
